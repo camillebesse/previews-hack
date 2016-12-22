@@ -10,35 +10,37 @@ module TopicListAddon
   def load_topics
     @topics = super
 
-    # SQL only works with postgresql 9.4+
     # TODO: better to keep track of previewed posts' id so they can be loaded at once
-    accepted_anwser_post_ids = @topics.map { |t| t.custom_fields["accepted_answer_post_id"]&.to_i }.compact
-    posts = Post.all.joins("JOIN unnest('{#{accepted_anwser_post_ids.join(',')}}'::int[]) WITH ORDINALITY t(id, ord) USING (id)").order("t.ord")
-    idx = 0
-    @topics.each do |t|
-      next unless t.custom_fields["accepted_answer_post_id"]
-      t.previewed_post = posts[idx]
-      idx += 1
-    end
-    normal_topic_ids = topics.delete_if { |t| t.custom_fields["accepted_answer_post_id"]&.to_i }.map(&:id)
-    posts = Post.where("post_number = 1 AND topic_id IN (?)", normal_topic_ids).joins("JOIN unnest('{#{normal_topic_ids.join(',')}}'::int[]) WITH ORDINALITY t(topic_id, ord) USING (topic_id)").order("t.ord")
-    idx = 0
-    @topics.each do |t|
-      next if t.custom_fields["accepted_answer_post_id"]
-      t.previewed_post = posts[idx]
-      idx += 1
+    posts_map = {}
+    post_actions_map = {}
+    accepted_anwser_post_ids = []
+    normal_topic_ids = []
+    previewed_post_ids = []
+    @topics.each do |topic|
+      if post_id = topic.custom_fields["accepted_answer_post_id"]&.to_i
+        accepted_anwser_post_ids << post_id
+      else
+        normal_topic_ids << topic.id
+      end
     end
 
+    Post.where("id IN (?)", accepted_anwser_post_ids).each do |post|
+      posts_map[post.topic_id] = post
+      previewed_post_ids << post.id
+    end
+    Post.where("post_number = 1 AND topic_id IN (?)", normal_topic_ids).each do |post|
+      posts_map[post.topic_id] = post
+      previewed_post_ids << post.id
+    end
     if @current_user
-      previewed_post_ids = @topics.map { |t| t.previewed_post&.id }.compact
-      post_actions_map = {}
-      PostAction.where("post_id IN (?) AND user_id = ?", previewed_post_ids, @current_user.id).each do |pa|
-        (post_actions_map[pa.post_id] ||= []) << pa
+      PostAction.where("post_id IN (?) AND user_id = ?", previewed_post_ids, @current_user.id).each do |post_action|
+        (post_actions_map[post_action.post_id] ||= []) << post_action
       end
-      @topics.each do |t|
-        next unless t.previewed_post
-        t.previewed_post_actions = post_actions_map[t.previewed_post.id]
-      end
+    end
+
+    @topics.each do |topic|
+      topic.previewed_post = posts_map[topic.id]
+      topic.previewed_post_actions = post_actions_map[topic.previewed_post.id] if topic.previewed_post
     end
 
     @topics
@@ -91,6 +93,7 @@ after_initialize do
 
   require_dependency 'guardian/post_guardian'
   module ::PostGuardian
+    # Passing existing loaded topic record avoids an N+1.
     def previewed_post_can_act?(post, topic, action_key, opts={})
       taken = opts[:taken_actions].try(:keys).to_a
       is_flag = PostActionType.is_flag?(action_key)
@@ -189,14 +192,18 @@ after_initialize do
     end
 
     def topic_post_id
-      object.previewed_post.id
+      object.previewed_post&.id
     end
 
     def excerpt
-      cooked = object.previewed_post.cooked
-      excerpt = PrettyText.excerpt(cooked, SiteSetting.topic_list_excerpt_length, keep_emoji_images: true)
-      excerpt.gsub!(/(\[#{I18n.t 'excerpt_image'}\])/, "") if excerpt
-      excerpt
+      if object.previewed_post
+        cooked = object.previewed_post.cooked
+        excerpt = PrettyText.excerpt(cooked, SiteSetting.topic_list_excerpt_length, keep_emoji_images: true)
+        excerpt.gsub!(/(\[#{I18n.t 'excerpt_image'}\])/, "") if excerpt
+        excerpt
+      else
+        object.excerpt
+      end
     end
 
     def include_excerpt?
@@ -252,7 +259,7 @@ after_initialize do
     alias :include_topic_post_liked? :topic_post_id
 
     def topic_post_like_count
-      object.previewed_post.like_count
+      object.previewed_post&.like_count
     end
 
     def include_topic_post_like_count?
@@ -266,7 +273,7 @@ after_initialize do
     alias :include_topic_post_can_like? :topic_post_id
 
     def topic_post_is_current_users
-      return scope.current_user && (object.previewed_post.user_id == scope.current_user.id)
+      return scope.current_user && (object.previewed_post&.user_id == scope.current_user.id)
     end
     alias :include_topic_post_is_current_users? :topic_post_id
 
